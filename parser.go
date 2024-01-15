@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/pmw-rp/splice"
+	"sort"
 	"strconv"
 )
 
@@ -707,17 +709,15 @@ func WriteToBuffer(buffer []byte, str string) int {
 }
 
 /*
-
 Del - Receives existing data structure, path to delete.
 
 Returns:
 `data` - return modified data
-
 */
-func Delete(data []byte, keys ...string) []byte {
+func DeleteDelta(data []byte, keys ...string) *Delta {
 	lk := len(keys)
 	if lk == 0 {
-		return data[:0]
+		return &Delta{deltaType: Deletion, lower: 0, upper: len(data)}
 	}
 
 	array := false
@@ -733,14 +733,14 @@ func Delete(data []byte, keys ...string) []byte {
 			_, _, startOffset, endOffset, err = internalGet(data, keys[:lk-1]...)
 			if err == KeyPathNotFoundError {
 				// problem parsing the data
-				return data
+				return &Delta{deltaType: Identity}
 			}
 		}
 
 		keyOffset, err = findKeyStart(data[startOffset:endOffset], keys[lk-1])
 		if err == KeyPathNotFoundError {
 			// problem parsing the data
-			return data
+			return &Delta{deltaType: Identity}
 		}
 		keyOffset += startOffset
 		_, _, _, subEndOffset, _ := internalGet(data[startOffset:endOffset], keys[lk-1])
@@ -759,7 +759,7 @@ func Delete(data []byte, keys ...string) []byte {
 		_, _, keyOffset, endOffset, err = internalGet(data, keys...)
 		if err == KeyPathNotFoundError {
 			// problem parsing the data
-			return data
+			return &Delta{deltaType: Identity}
 		}
 
 		tokEnd := tokenEnd(data[endOffset:])
@@ -783,25 +783,50 @@ func Delete(data []byte, keys ...string) []byte {
 		newOffset = prevTok + 1
 	}
 
-	// We have to make a copy here if we don't want to mangle the original data, because byte slices are
-	// accessed by reference and not by value
-	dataCopy := make([]byte, len(data))
-	copy(dataCopy, data)
-	data = append(dataCopy[:newOffset], dataCopy[endOffset:]...)
+	return &Delta{deltaType: Deletion, lower: newOffset, upper: endOffset}
+}
 
-	return data
+func Delete(data []byte, keys ...string) []byte {
+	delta := DeleteDelta(data, keys...)
+	result, _ := Apply([]*Delta{delta}, data)
+	return result
+}
+
+type DeltaType int
+
+const (
+	Identity DeltaType = iota
+	Replacement
+	Deletion
+)
+
+type Delta struct {
+	deltaType DeltaType
+	data      *[]byte
+	lower     int
+	upper     int
+}
+
+func (d *Delta) Length() int {
+	switch d.deltaType {
+	case Deletion:
+		return -1 * (d.upper - d.lower)
+	case Replacement:
+		prev := d.upper - d.lower
+		next := len(*d.data)
+		return next - prev
+	}
+	return 0
 }
 
 /*
-
 Set - Receives existing data structure, path to set, and data to set at that key.
 
 Returns:
 `value` - modified byte array
 `err` - On any parsing error
-
 */
-func Set(data []byte, setValue []byte, keys ...string) (value []byte, err error) {
+func SetDelta(data []byte, setValue []byte, keys ...string) (delta *Delta, err error) {
 	// ensure keys are set
 	if len(keys) == 0 {
 		return nil, KeyPathNotFoundError
@@ -859,19 +884,82 @@ func Set(data []byte, setValue []byte, keys ...string) (value []byte, err error)
 		} else {
 			startOffset = depthOffset
 		}
-		value = append(data[:startOffset], append(createInsertComponent(keys[depth:], setValue, comma, object), data[depthOffset:]...)...)
+		insertedData := createInsertComponent(keys[depth:], setValue, comma, object)
+		delta = &Delta{
+			deltaType: Replacement,
+			data:      &insertedData,
+			lower:     startOffset,
+			upper:     depthOffset,
+		}
 	} else {
-		// path currently exists
-		startComponent := data[:startOffset]
-		endComponent := data[endOffset:]
-
-		value = make([]byte, len(startComponent)+len(endComponent)+len(setValue))
-		newEndOffset := startOffset + len(setValue)
-		copy(value[0:startOffset], startComponent)
-		copy(value[startOffset:newEndOffset], setValue)
-		copy(value[newEndOffset:], endComponent)
+		delta = &Delta{
+			deltaType: Replacement,
+			data:      &setValue,
+			lower:     startOffset,
+			upper:     endOffset,
+		}
 	}
-	return value, nil
+	return delta, nil
+}
+
+func validateDeltas(deltas []*Delta) error {
+	i := 0 // last offset affected by a delta
+	for _, delta := range deltas {
+		if delta.lower < i {
+			return errors.New("delta offsets overlap")
+		}
+		i = delta.upper
+	}
+	return nil
+}
+
+func Apply(deltas []*Delta, data []byte) ([]byte, error) {
+	sort.Slice(deltas, func(i, j int) bool {
+		if deltas[i].lower < deltas[j].lower {
+			return true
+		}
+		if deltas[i].lower == deltas[j].lower {
+			if deltas[i].deltaType == Deletion {
+				return true
+			}
+		}
+		return false
+	})
+	err := validateDeltas(deltas)
+	if err != nil {
+		return data[:0], err
+	}
+	s := splice.NewSplice(data)
+	lengthDelta := 0
+	for _, delta := range deltas {
+		switch delta.deltaType {
+		case Identity:
+			return data, nil
+		case Replacement:
+			s.Delete(delta.lower+lengthDelta, delta.upper-delta.lower)
+			s.Insert(delta.data, delta.lower+lengthDelta)
+		case Deletion:
+			s.Delete(delta.lower+lengthDelta, delta.upper-delta.lower)
+		}
+		lengthDelta = lengthDelta + delta.Length()
+	}
+	return s.Compact(), nil
+}
+
+/*
+Set - Receives existing data structure, path to set, and data to set at that key.
+
+Returns:
+`value` - modified byte array
+`err` - On any parsing error
+*/
+func Set(data []byte, setValue []byte, keys ...string) (value []byte, err error) {
+	delta, err := SetDelta(data, setValue, keys...)
+	if err != nil {
+		return data, err
+	}
+	result, err := Apply([]*Delta{delta}, data)
+	return result, nil
 }
 
 func getType(data []byte, offset int) ([]byte, ValueType, int, error) {

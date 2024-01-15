@@ -1977,3 +1977,29 @@ func TestParseString(t *testing.T) {
 		},
 	)
 }
+
+func TestNonOverlappingDeltas(t *testing.T) {
+	deltaA := Delta{Deletion, nil, 0, 10}
+	deltaB := Delta{Deletion, nil, 15, 20}
+	data := []byte("aaaaabbbbbcccccdddddeeeee")
+	processed, err := Apply([]*Delta{&deltaA, &deltaB}, data)
+	if err != nil {
+		t.Fail()
+		return
+	}
+	expected := []byte("ccccceeeee")
+	if !bytes.Equal(expected, processed) {
+		t.Fail()
+	}
+}
+
+func TestOverlappingDeltas(t *testing.T) {
+	deltaA := Delta{Deletion, nil, 5, 15}
+	deltaB := Delta{Deletion, nil, 0, 10}
+	data := []byte("aaaaabbbbbcccccdddddeeeee")
+	_, err := Apply([]*Delta{&deltaA, &deltaB}, data)
+	if err == nil {
+		t.Fail()
+		return
+	}
+}
